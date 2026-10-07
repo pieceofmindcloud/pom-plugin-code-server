@@ -125,7 +125,8 @@ fn release_contract_is_namespaced_and_published_as_a_public_github_plugin() {
     assert!(package.contains(r#"'($contract[0]) + {release_id:$release_id, version:$version, os:$os, arch:$arch, asset:$asset, sha256:$sha256, size:$size}'"#));
     let workflow = text(".github/workflows/publish-release.yml");
     assert!(workflow.contains("softprops/action-gh-release"));
-    assert!(!workflow.contains("license-server") && !workflow.contains("POM_RELEASE_TOKEN"));
+    // Stable releases also go to the license server, POM's fallback.
+    assert!(workflow.contains("license-server") && workflow.contains("POM_RELEASE_TOKEN"));
 }
 
 #[test]
