@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
-import { prefixedLocation, proxyResponseHeaders, tokenMatches } from "../../runtime/launcher.mjs";
+import { prefixedLocation, proxyResponseHeaders, tokenMatches, workbenchFolder, workbenchRedirect } from "../../runtime/launcher.mjs";
 
 const PREFIX = "/api/ui/plugins/code_server/proxy";
 
@@ -193,4 +193,21 @@ test("launcher gates HTTP and WebSocket traffic and mounts code-server below the
   const restarted = await fetch(`${base}/_pom/restart`, { method: "POST", headers });
   assert.equal(restarted.status, 202);
   assert.equal((await waitForStatus(base, ready.token)).status, "ready");
+});
+
+test("a Windows workspace reaches the workbench as a URI path with its drive", () => {
+  assert.equal(workbenchFolder("C:\\Users\\me\\pom_workspace", true), "/c:/Users/me/pom_workspace");
+  assert.equal(workbenchFolder("D:\\data\\", true), "/d:/data");
+  assert.equal(workbenchFolder("/c:/Users/me", true), "/c:/Users/me");
+  assert.equal(workbenchFolder("/home/me/pom_workspace", false), "/home/me/pom_workspace");
+});
+
+test("the Windows workbench is redirected to the workspace, keeping other parameters", () => {
+  const workspace = "C:\\Users\\me\\pom_workspace";
+  assert.equal(workbenchRedirect("/", workspace, true), "?folder=%2Fc%3A%2FUsers%2Fme%2Fpom_workspace");
+  assert.equal(workbenchRedirect("/?folder=C%3A%5Cother", workspace, true), "?folder=%2Fc%3A%2Fother");
+  assert.equal(workbenchRedirect("/?folder=%2Fc%3A%2Fother", workspace, true), "");
+  assert.equal(workbenchRedirect("/?workspace=%2Fc%3A%2Fa.code-workspace", workspace, true), "");
+  assert.equal(workbenchRedirect("/?tkn=x", workspace, true), "?tkn=x&folder=%2Fc%3A%2FUsers%2Fme%2Fpom_workspace");
+  assert.equal(workbenchRedirect("/", "/home/me/pom_workspace", false), "");
 });

@@ -273,6 +273,42 @@ export const SEED_SCRIPT = `(function () {
 `;
 
 /** Adds the seed script as the first element of the workbench `<head>`. */
+/**
+ * The folder as the workbench expects it in `?folder=`. VS Code reads the value as
+ * the path of a remote URI, so a Windows path must be `/c:/Users/...`: given
+ * `C:\Users\...`, the browser parsed `C:` as a URI scheme and opened
+ * `\Users\...` without its drive, which the editor then failed to open.
+ */
+export function workbenchFolder(path, isWindows) {
+  if (!isWindows) return path;
+  const drive = /^([A-Za-z]):[\\/]*(.*)$/.exec(path);
+  if (!drive) return path.replace(/\\/g, "/");
+  const rest = drive[2].replace(/\\/g, "/").replace(/\/+$/, "");
+  return `/${drive[1].toLowerCase()}:/${rest}`;
+}
+
+/**
+ * Where to send a workbench request so it opens `folder`, or "" to serve it as is.
+ * A request that names nothing gets the workspace; a `folder` still in drive form
+ * (`C:\...`) is rewritten. Both redirect with a relative query, so the POM prefix
+ * in front of the plugin stays intact.
+ */
+export function workbenchRedirect(url, folder, isWindows) {
+  if (!isWindows || !folder) return "";
+  const parsed = new URL(url, "http://code-server.invalid");
+  const params = parsed.searchParams;
+  const current = params.get("folder");
+  if (current === null) {
+    if (params.has("workspace") || params.has("ew")) return "";
+    params.set("folder", workbenchFolder(folder, true));
+  } else {
+    const fixed = workbenchFolder(current, true);
+    if (fixed === current) return "";
+    params.set("folder", fixed);
+  }
+  return `?${params.toString()}`;
+}
+
 export function injectSeed(html) {
   const tag = '<script src="./_pom/seed.js"></script>';
   if (html.includes(tag)) return html;
@@ -361,8 +397,10 @@ async function startCodeServer() {
     "--extensions-dir",
     extensions,
     "--ignore-last-opened",
-    workspace,
   ];
+  // On Windows the proxy opens the workspace through `?folder=` in URI form
+  // (`workbenchRedirect`); code-server's own redirect would carry `C:\...`.
+  if (!windows) args.push(workspace);
   const child = spawn(nodeBin, args, {
     cwd: workspace,
     env: serverEnvironment(),
@@ -461,6 +499,12 @@ function proxyHttp(request, response, proxyPort) {
   const pathname = new URL(request.url, "http://code-server.invalid").pathname;
   // The workbench page gets the one-time chat seed; everything else streams.
   const workbenchPage = request.method === "GET" && pathname === "/" && /text\/html/.test(request.headers.accept || "");
+  const redirect = workbenchPage ? workbenchRedirect(request.url, workspace, windows) : "";
+  if (redirect) {
+    response.writeHead(302, { location: redirect, "cache-control": "no-store" });
+    response.end();
+    return;
+  }
   const headers = outgoingHeaders(request.headers, proxyPort);
   if (workbenchPage) delete headers["accept-encoding"];
   const outbound = http.request({
