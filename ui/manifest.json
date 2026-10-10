@@ -46,6 +46,10 @@
       {
         "run": ["scripts/dev-ui.sh"],
         "os": ["linux", "macos"]
+      },
+      {
+        "run": ["scripts/dev-release.sh"],
+        "os": ["linux", "macos"]
       }
     ]
   }

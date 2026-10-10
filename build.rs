@@ -16,6 +16,25 @@ fn content_type(name: &str) -> &'static str {
 
 /// Embeds the pinned release metadata only. The archive itself is downloaded
 /// and verified on the node after installation, keeping the plugin small.
+/// `KEY=VALUE` lines written by `scripts/dev-release.sh` into `POM_PLUGIN_OUT_DIR`.
+fn local_release_metadata() -> std::collections::HashMap<String, String> {
+    println!("cargo:rerun-if-env-changed=POM_PLUGIN_OUT_DIR");
+    let Some(path) = env::var("POM_PLUGIN_OUT_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|out| Path::new(&out).join("code-server-release.env"))
+    else {
+        return Default::default();
+    };
+    println!("cargo:rerun-if-changed={}", path.display());
+    fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
 fn server_release(generated: &mut String) {
     for key in [
         "CODE_SERVER_URL",
@@ -33,7 +52,15 @@ fn server_release(generated: &mut String) {
             .join("runtime/launcher.mjs")
             .to_string_lossy()
     ));
-    let read = |key: &str| env::var(key).ok().filter(|value| !value.is_empty());
+    // The release build passes these through the environment (scripts/build.sh);
+    // the POM's local rebuild writes them to POM_PLUGIN_OUT_DIR (scripts/dev-release.sh).
+    let local = local_release_metadata();
+    let read = |key: &str| {
+        env::var(key)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| local.get(key).cloned())
+    };
     let url = read("CODE_SERVER_URL").unwrap_or_default();
     let checksum = read("CODE_SERVER_SHA256").unwrap_or_default();
     let version = read("CODE_SERVER_VERSION").unwrap_or_default();
