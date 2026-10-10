@@ -1,6 +1,7 @@
 {
   "schema": "pom-plugin-ui/v1",
   "plugin_code": "code_server",
+  "lifecycle": "on_demand",
   "icon_image": "ui/icon.png",
   "description": {
     "en": "Run the official code-server VS Code experience in the POM admin UI, backed by the POM shared workspace.",
