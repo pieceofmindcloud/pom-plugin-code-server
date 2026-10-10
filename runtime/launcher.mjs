@@ -7,6 +7,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -21,7 +22,10 @@ const token = randomBytes(32).toString("base64url");
 const TOKEN_HEADER = "x-pom-plugin-token";
 const STATUS_PATH = "/_pom/status";
 const RESTART_PATH = "/_pom/restart";
+const PREFERENCES_PATH = "/_pom/preferences";
+const PREFERENCES_FILE = "preferences.json";
 const SEED_PATH = "/_pom/seed.js";
+const QUIET_PATH = "/_pom/quiet.js";
 const gatewayBase = (env.POM_GATEWAY_BASE_URL || "").replace(/\/+$/, "");
 const gatewayKey = env.POM_GATEWAY_API_KEY || "";
 /** Name of the provider group the plugin owns in chatLanguageModels.json. */
@@ -33,6 +37,8 @@ let modelFacadeUrl = "";
 let codeServer;
 let codeServerPort;
 let restartInProgress = false;
+let restartQueued = false;
+let preferences = {};
 let shuttingDown = false;
 let runtimeStatus = { status: "starting" };
 let reported = false;
@@ -236,6 +242,173 @@ export function writeChatSettings(userDataDir) {
   writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
 }
 
+/** VS Code setting values for the POM's two themes (the built-in "Dark Modern" and "Light Modern"). */
+export const EDITOR_THEMES = { dark: "Dark Modern", light: "Light Modern" };
+
+/**
+ * The preferences the POM sends (`{theme, locale}`), or null when the body is not
+ * a JSON object. Unknown themes are ignored; a locale must look like a language tag
+ * (VS Code keeps them lowercase, e.g. `pt-br`).
+ */
+export function parsePreferences(text) {
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = {};
+  if (value.theme === "dark" || value.theme === "light") result.theme = value.theme;
+  if (typeof value.locale === "string" && /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(value.locale)) {
+    result.locale = value.locale.toLowerCase();
+  }
+  return result;
+}
+
+/**
+ * Sets the editor theme to match the POM. VS Code watches `settings.json`, so the
+ * change reaches an open editor without a restart. Other settings are kept.
+ */
+export function writeEditorTheme(userDataDir, theme) {
+  const directory = join(userDataDir, "User");
+  mkdirSync(directory, { recursive: true });
+  const file = join(directory, "settings.json");
+  let settings = {};
+  if (existsSync(file)) {
+    try {
+      settings = JSON.parse(readFileSync(file, "utf8") || "{}");
+    } catch {
+      log("settings.json is not plain JSON; the editor theme is not changed");
+      return;
+    }
+  }
+  if (settings === null || typeof settings !== "object" || Array.isArray(settings)) return;
+  settings["workbench.colorTheme"] = EDITOR_THEMES[theme];
+  writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+function loadPreferences() {
+  if (!dataDir) return {};
+  try {
+    return parsePreferences(readFileSync(join(dataDir, PREFERENCES_FILE), "utf8")) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function savePreferences(value) {
+  if (!dataDir) return;
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(join(dataDir, PREFERENCES_FILE), `${JSON.stringify(value)}\n`);
+}
+
+/** The VS Code language pack for a locale: `pt-br` is `ms-ceintl.vscode-language-pack-pt-br`. */
+export function languagePackId(locale) {
+  return `ms-ceintl.vscode-language-pack-${locale}`;
+}
+
+function validLocalization(entry) {
+  if (typeof entry?.languageId !== "string" || !Array.isArray(entry.translations) || entry.translations.length === 0) return false;
+  if (!entry.translations.every((item) => typeof item?.id === "string" && typeof item?.path === "string")) return false;
+  return !((entry.languageName && typeof entry.languageName !== "string") || (entry.localizedLanguageName && typeof entry.localizedLanguageName !== "string"));
+}
+
+/**
+ * The `languagepacks.json` that VS Code writes when a language pack is installed
+ * (`createLanguagePacksFromExtension`). Without it the server does not use the pack,
+ * even when started with `--locale`. `extensions` items are `{identifier, version, dir, manifest}`.
+ */
+export function languagePacksFromExtensions(extensions) {
+  const packs = {};
+  for (const { identifier, version, dir, manifest } of extensions) {
+    const localizations = manifest?.contributes?.localizations;
+    if (!Array.isArray(localizations)) continue;
+    for (const entry of localizations) {
+      if (!validLocalization(entry)) continue;
+      const pack = (packs[entry.languageId] ??= {
+        hash: "",
+        extensions: [],
+        translations: {},
+        label: entry.localizedLanguageName ?? entry.languageName,
+      });
+      const key = identifier.uuid || identifier.id;
+      const installed = pack.extensions.find((item) => (item.extensionIdentifier.uuid || item.extensionIdentifier.id) === key);
+      if (installed) installed.version = version;
+      else pack.extensions.push({ extensionIdentifier: identifier, version });
+      for (const translation of entry.translations) pack.translations[translation.id] = join(dir, translation.path);
+    }
+  }
+  for (const pack of Object.values(packs)) {
+    const digest = createHash("md5");
+    for (const item of pack.extensions) digest.update(item.extensionIdentifier.uuid || item.extensionIdentifier.id).update(item.version);
+    pack.hash = digest.digest("hex");
+  }
+  return packs;
+}
+
+/** The extensions VS Code registered in `extensions.json`, with their manifests. */
+export function readInstalledExtensions(extensionsDir) {
+  let registry;
+  try {
+    registry = JSON.parse(readFileSync(join(extensionsDir, "extensions.json"), "utf8"));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(registry)) return [];
+  const result = [];
+  for (const item of registry) {
+    if (typeof item?.identifier?.id !== "string" || typeof item.relativeLocation !== "string") continue;
+    const dir = join(extensionsDir, item.relativeLocation);
+    try {
+      const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      result.push({ identifier: item.identifier, version: item.version ?? manifest.version, dir, manifest });
+    } catch {
+      // A missing or unreadable extension is skipped, not fatal.
+    }
+  }
+  return result;
+}
+
+/** Writes `languagepacks.json` for the extensions installed in `extensionsDir`. */
+export function writeLanguagePacks(extensionsDir, userDataDir) {
+  mkdirSync(userDataDir, { recursive: true });
+  const packs = languagePacksFromExtensions(readInstalledExtensions(extensionsDir));
+  writeFileSync(join(userDataDir, "languagepacks.json"), JSON.stringify(packs));
+}
+
+/**
+ * Makes the display language available: installs the locale's language pack from the
+ * extension marketplace once, then writes the pack registry. Resolves false when the
+ * pack cannot be made available, and the editor stays in English.
+ */
+export async function ensureLanguagePack(codeRoot, locale, extensionsDir, userDataDir) {
+  const id = languagePackId(locale);
+  const installed = readInstalledExtensions(extensionsDir).some((item) => item.identifier.id === id);
+  if (!installed) {
+    const code = await new Promise((resolve) => {
+      const child = spawn(nodeBin, [join(codeRoot, "out", "node", "entry.js"), "--extensions-dir", extensionsDir, "--user-data-dir", userDataDir, "--install-extension", id], {
+        stdio: ["ignore", "ignore", "pipe"],
+        windowsHide: true,
+      });
+      child.stderr.on("data", (chunk) => process.stderr.write(`code-server: ${chunk}`));
+      child.on("error", () => resolve(-1));
+      child.on("exit", (exitCode) => resolve(exitCode));
+    });
+    if (code !== 0) {
+      log(`language pack ${id} could not be installed; the editor stays in English`);
+      return false;
+    }
+  }
+  try {
+    writeLanguagePacks(extensionsDir, userDataDir);
+  } catch (error) {
+    log(`could not register language pack ${id}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+  return true;
+}
+
 /**
  * Runs once per browser before the workbench loads. VS Code disables its
  * built-in chat extension until a GitHub "chat setup" completes and keeps that
@@ -309,8 +482,29 @@ export function workbenchRedirect(url, folder, isWindows) {
   return `?${params.toString()}`;
 }
 
+/**
+ * Acknowledges code-server's "accessed in an insecure context" notice. The page
+ * is served over plain HTTP on the POM's address, so the notice is accurate; the
+ * script only presses its "I understand" button. `isSecureContext` is left as it is.
+ */
+export const QUIET_SCRIPT = `(function () {
+  var TEXT = "is being accessed in an insecure context";
+  function acknowledge() {
+    var toasts = document.querySelectorAll(".notification-toast");
+    for (var i = 0; i < toasts.length; i++) {
+      if (toasts[i].textContent.indexOf(TEXT) === -1) continue;
+      var buttons = toasts[i].querySelectorAll("a, button");
+      for (var j = 0; j < buttons.length; j++) {
+        if (buttons[j].textContent.trim() === "I understand") { buttons[j].click(); return; }
+      }
+    }
+  }
+  new MutationObserver(acknowledge).observe(document.documentElement, { childList: true, subtree: true });
+})();
+`;
+
 export function injectSeed(html) {
-  const tag = '<script src="./_pom/seed.js"></script>';
+  const tag = '<script src="./_pom/seed.js"></script>\n\t\t<script src="./_pom/quiet.js"></script>';
   if (html.includes(tag)) return html;
   return html.replace(/<head(\s[^>]*)?>/i, (head) => `${head}\n\t\t${tag}`);
 }
@@ -378,13 +572,17 @@ async function startCodeServer() {
 
   const port = await freePort();
   const userData = join(dataDir, "user-data");
+  const extensionsDir = join(dataDir, "extensions");
+  const languageReady = preferences.locale && preferences.locale !== "en"
+    ? await ensureLanguagePack(codeRoot, preferences.locale, extensionsDir, userData)
+    : false;
   try {
     writeChatModels(userData, modelFacadeUrl);
     if (modelFacadeUrl) writeChatSettings(userData);
+    if (preferences.theme) writeEditorTheme(userData, preferences.theme);
   } catch (error) {
     log(`could not configure POM models for the chat: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const extensions = join(dataDir, "extensions");
   const args = [
     codeRoot,
     `--bind-addr=127.0.0.1:${port}`,
@@ -395,9 +593,11 @@ async function startCodeServer() {
     "--user-data-dir",
     userData,
     "--extensions-dir",
-    extensions,
+    extensionsDir,
     "--ignore-last-opened",
   ];
+  // The display language is read when code-server starts, so a change restarts it.
+  if (languageReady) args.push(`--locale=${preferences.locale}`);
   // On Windows the proxy opens the workspace through `?folder=` in URI form
   // (`workbenchRedirect`); code-server's own redirect would carry `C:\...`.
   if (!windows) args.push(workspace);
@@ -444,7 +644,11 @@ async function startCodeServer() {
 }
 
 async function restartCodeServer() {
-  if (restartInProgress || shuttingDown) return;
+  if (shuttingDown) return;
+  if (restartInProgress) {
+    restartQueued = true;
+    return;
+  }
   restartInProgress = true;
   log("code-server restart requested");
   runtimeStatus = { status: "starting" };
@@ -458,6 +662,10 @@ async function restartCodeServer() {
     await stopCodeServer();
   } finally {
     restartInProgress = false;
+  }
+  if (restartQueued && !shuttingDown) {
+    restartQueued = false;
+    await restartCodeServer();
   }
 }
 
@@ -599,8 +807,8 @@ function startProxyServer() {
       sendJson(response, 200, runtimeStatus);
       return;
     }
-    if (pathname === SEED_PATH && request.method === "GET") {
-      const body = Buffer.from(SEED_SCRIPT);
+    if ((pathname === SEED_PATH || pathname === QUIET_PATH) && request.method === "GET") {
+      const body = Buffer.from(pathname === QUIET_PATH ? QUIET_SCRIPT : SEED_SCRIPT);
       response.writeHead(200, {
         "content-type": "text/javascript; charset=utf-8",
         "content-length": body.length,
@@ -608,6 +816,34 @@ function startProxyServer() {
         "x-content-type-options": "nosniff",
       });
       response.end(body);
+      return;
+    }
+    if (pathname === PREFERENCES_PATH && request.method === "POST") {
+      readBody(request, 16 * 1024)
+        .then((body) => {
+          const next = parsePreferences(body.toString("utf8"));
+          if (!next) {
+            sendJson(response, 400, { error: "invalid preferences" });
+            return;
+          }
+          const localeChanged = next.locale !== undefined && next.locale !== preferences.locale;
+          preferences = { ...preferences, ...next };
+          savePreferences(preferences);
+          if (preferences.theme) {
+            try {
+              writeEditorTheme(join(dataDir, "user-data"), preferences.theme);
+            } catch (error) {
+              log(`could not set the editor theme: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+          if (localeChanged) {
+            sendJson(response, 202, { status: "restarting" });
+            void restartCodeServer();
+          } else {
+            sendJson(response, 200, { status: runtimeStatus.status });
+          }
+        })
+        .catch(() => sendJson(response, 400, { error: "invalid preferences" }));
       return;
     }
     if (pathname === RESTART_PATH && request.method === "POST") {
@@ -647,6 +883,7 @@ async function main() {
       log(`model facade unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  preferences = loadPreferences();
   proxyServer = await startProxyServer();
   report({ status: "ready", port: proxyServer.address().port, token, detail: { version } });
   void restartCodeServer();

@@ -11,14 +11,28 @@ type RuntimeStatus = {
 
 const megabytes = (bytes: number) => (bytes / (1024 * 1024)).toFixed(0);
 
+/** The POM's theme, read from the page and followed while it changes. */
+function usePomTheme(): "light" | "dark" {
+  const read = () => (document.documentElement.dataset.theme === "light" ? "light" : "dark");
+  const [theme, setTheme] = useState(read);
+  useEffect(() => {
+    const observer = new MutationObserver(() => setTheme(read()));
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => observer.disconnect();
+  }, []);
+  return theme;
+}
+
 export function Editor() {
-  const { t } = usePluginI18n();
+  const { t, locale } = usePluginI18n();
+  const theme = usePomTheme();
   const [state, setState] = useState<"starting" | "ready" | "error">("starting");
   const [message, setMessage] = useState("");
   const [canRestart, setCanRestart] = useState(false);
   const [install, setInstall] = useState<{ downloaded: number; total: number; version: string } | null>(null);
   const [reload, setReload] = useState(0);
   const startedAt = useRef(Date.now());
+  const appliedTheme = useRef<"light" | "dark" | null>(null);
 
   const poll = useCallback(async (signal: AbortSignal) => {
     // While the runtime downloads there is no editor to proxy to: ask the
@@ -74,6 +88,38 @@ export function Editor() {
       // The node proxy reports 503 until host.configure finishes launching the IDE.
     }
   }, [t]);
+
+  // The POM's theme and language follow into the editor. A theme change applies
+  // at once; a language change restarts the editor, which reads it when it starts.
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${PROXY}/_pom/preferences`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ theme, locale }),
+    })
+      .then((response) => {
+        if (cancelled || !response.ok) return;
+        const previous = appliedTheme.current;
+        appliedTheme.current = theme;
+        if (response.status === 202) {
+          // A language change restarts the editor: wait for it to come back.
+          setState("starting");
+          setCanRestart(false);
+          setMessage("");
+          startedAt.current = Date.now();
+          setReload((value) => value + 1);
+        } else if (previous !== null && previous !== theme) {
+          // The workbench reads its theme when it loads: reload the frame.
+          setReload((value) => value + 1);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [theme, locale]);
 
   useEffect(() => {
     const controller = new AbortController();

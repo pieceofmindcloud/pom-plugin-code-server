@@ -97,7 +97,7 @@ test("chat configuration keeps the person's groups and settings", () => {
 test("the workbench page gets the seed script once, first in head", () => {
   const html = '<!DOCTYPE html>\n<html>\n\t<head>\n\t\t<script nonce="x">a()</script>';
   const injected = injectSeed(html);
-  assert.match(injected, /<head>\n\t\t<script src="\.\/_pom\/seed\.js"><\/script>\n\t\t<script nonce/);
+  assert.match(injected, /<head>\n\t\t<script src="\.\/_pom\/seed\.js"><\/script>\n\t\t<script src="\.\/_pom\/quiet\.js"><\/script>\n\t\t<script nonce/);
   assert.equal(injectSeed(injected), injected);
   assert.match(SEED_SCRIPT, /github\.copilot-chat/);
   assert.match(SEED_SCRIPT, /builtinChatExtensionEnablementMigration/);
