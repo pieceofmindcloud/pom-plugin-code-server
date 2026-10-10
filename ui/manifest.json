@@ -40,5 +40,13 @@
     "en": "i18n/en.json",
     "pt-BR": "i18n/pt-BR.json"
   },
-  "assets": ["ui/screens.js", "ui/plugin.css", "ui/icon.png", "i18n/en.json", "i18n/pt-BR.json", "docs/README.md"]
+  "assets": ["ui/screens.js", "ui/plugin.css", "ui/icon.png", "i18n/en.json", "i18n/pt-BR.json", "docs/README.md"],
+  "development": {
+    "rebuild": [
+      {
+        "run": ["scripts/dev-ui.sh"],
+        "os": ["linux", "macos"]
+      }
+    ]
+  }
 }
