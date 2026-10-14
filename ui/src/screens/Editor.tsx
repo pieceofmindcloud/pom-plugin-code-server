@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { pluginRpc, usePluginI18n } from "../host/runtime";
+import { useScreenReady } from "../host/ready";
 
 const PROXY = "/api/ui/plugins/code_server/proxy";
 
@@ -130,6 +131,11 @@ export function Editor() {
       window.clearInterval(timer);
     };
   }, [poll, reload]);
+
+  // The editor frame is the content of this screen: the host opens it when
+  // there is an editor to show (or a failure to explain), not over the
+  // starting spinner.
+  useScreenReady(state === "ready" || state === "error");
 
   const restart = async () => {
     setState("starting");
