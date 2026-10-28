@@ -10,5 +10,6 @@
   "installing": "Baixando o VS Code…",
   "installingDetail": "Na primeira ativação, o release oficial do code-server {version} é baixado uma única vez e tem o checksum conferido. As próximas inicializações são imediatas.",
   "installingProgress": "{done} de {total} MB · {percent}%",
-  "installingBytes": "{done} MB"
+  "installingBytes": "{done} MB",
+  "loader.installing": "Instalando o code-server"
 }

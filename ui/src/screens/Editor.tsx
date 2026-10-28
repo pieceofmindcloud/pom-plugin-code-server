@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { pluginRpc, usePluginI18n } from "../host/runtime";
+import { hostVersion, loader, onLoaderRetry, pluginRpc, usePluginI18n } from "../host/runtime";
 import { useScreenReady } from "../host/ready";
 
 const PROXY = "/api/ui/plugins/code_server/proxy";
@@ -34,6 +34,10 @@ export function Editor() {
   const [reload, setReload] = useState(0);
   const startedAt = useRef(Date.now());
   const appliedTheme = useRef<"light" | "dark" | null>(null);
+  // POM's loader covers the screen while the runtime downloads and the editor starts (host version 7).
+  const covered = hostVersion() >= 7;
+  // A download ran in this mount: the end is a success, not a plain opening.
+  const installed = useRef(false);
 
   const poll = useCallback(async (signal: AbortSignal) => {
     // While the runtime downloads there is no editor to proxy to: ask the
@@ -132,6 +136,38 @@ export function Editor() {
     };
   }, [poll, reload]);
 
+  // POM's loader says what the editor is doing; the frame's load opens the screen.
+  // `t` is a new function on every render; the loader follows state changes, not renders.
+  const say = useRef(t);
+  say.current = t;
+  useEffect(() => {
+    if (!covered) return;
+    const t = say.current;
+    if (state === "error") {
+      void loader.error({ title: t("failed"), message, retry: canRestart });
+    } else if (state === "starting" && install) {
+      installed.current = true;
+      const share = install.total ? install.downloaded / install.total : 0;
+      void loader.progress({
+        title: t("loader.installing"),
+        progress: Math.floor(share * 95),
+        message: install.total
+          ? t("installingProgress", { done: megabytes(install.downloaded), total: megabytes(install.total), percent: Math.floor(share * 100) })
+          : t("installingBytes", { done: megabytes(install.downloaded) }),
+      });
+    } else if (state === "starting") {
+      void (installed.current
+        ? loader.progress({ title: t("loader.installing"), progress: 100, message: t("starting") })
+        : loader.show({ message: t("starting") }));
+    }
+  }, [covered, state, install, message, canRestart]);
+
+  const frameLoaded = () => {
+    if (!covered) return;
+    void (installed.current ? loader.success() : loader.hide());
+    installed.current = false;
+  };
+
   // The editor frame is the content of this screen: the host opens it when
   // there is an editor to show (or a failure to explain), not over the
   // starting spinner.
@@ -158,6 +194,11 @@ export function Editor() {
     }
   };
 
+  // "Try again" on the loader's error restarts the editor.
+  const restartRef = useRef(restart);
+  restartRef.current = restart;
+  useEffect(() => onLoaderRetry(() => void restartRef.current()), []);
+
   return (
     <main className="cs-page">
       {state === "ready" ? (
@@ -167,8 +208,9 @@ export function Editor() {
           src={`${PROXY}/`}
           title={t("frameTitle")}
           allow="clipboard-read; clipboard-write"
+          onLoad={frameLoaded}
         />
-      ) : (
+      ) : covered ? null : (
         <section className="cs-status" role="status" aria-live="polite">
           {state === "starting" && <span className="cs-spinner" aria-hidden="true" />}
           <h1 className="cs-title">{state === "error" ? t("failed") : install ? t("installing") : t("starting")}</h1>

@@ -10,5 +10,6 @@
   "installing": "Downloading VS Code…",
   "installingDetail": "The first activation downloads the official code-server {version} release once and verifies its checksum. Next starts are immediate.",
   "installingProgress": "{done} of {total} MB · {percent}%",
-  "installingBytes": "{done} MB"
+  "installingBytes": "{done} MB",
+  "loader.installing": "Installing code-server"
 }
